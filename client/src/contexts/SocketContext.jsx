@@ -17,7 +17,7 @@ export const SocketProvider = ({ children }) => {
   const [socket, setSocket] = useState(null);
   const [isConnected, setIsConnected] = useState(false);
   const { user } = useAuth();
-
+  
   useEffect(() => {
     if (user) {
       // Connect to Socket.io server

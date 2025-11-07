@@ -33,23 +33,197 @@ class Course {
       query += ` WHERE ${conditions.join(' AND ')}`;
     }
     
-    query += ` GROUP BY c.id ORDER BY c.created_at ASC`;
+    query += ` GROUP BY c.id ORDER BY c.id ASC`;
     
     const result = await pool.query(query, values);
     return result.rows;
   }
 
-  static async findById(id) {
+  // static async findById(id, userId = null) {
+  //   const query = `
+  //     SELECT c.*, 
+  //            JSON_AGG(
+  //              JSON_BUILD_OBJECT(
+  //                'id', l.id,
+  //                'title', l.title,
+  //                'description', l.description,
+  //                'order_index', l.order_index,
+  //                'estimated_duration', l.estimated_duration,
+  //                'is_completed', EXISTS(
+  //                  SELECT 1 FROM user_progress up 
+  //                  WHERE up.lesson_id = l.id AND up.user_id = $2 AND up.completed = true
+  //                ),
+  //                'user_score', (
+  //                  SELECT up.score FROM user_progress up 
+  //                  WHERE up.lesson_id = l.id AND up.user_id = $2
+  //                )
+  //              ) ORDER BY l.order_index ASC
+  //            ) as lessons,
+  //            (
+  //              SELECT COUNT(*) FROM lessons l2 WHERE l2.course_id = c.id
+  //            ) as total_lessons,
+  //            (
+  //              SELECT COUNT(*) FROM user_progress up
+  //              JOIN lessons l3 ON up.lesson_id = l3.id
+  //              WHERE up.user_id = $2 AND up.completed = true AND l3.course_id = c.id
+  //            ) as completed_lessons
+  //     FROM courses c
+  //     LEFT JOIN lessons l ON c.id = l.course_id
+  //     WHERE c.id = $1
+  //     GROUP BY c.id
+  //   `;
+    
+  //   const result = await pool.query(query, [id, userId]);
+  //   return result.rows[0];
+  // }
+static async findById(id, userId = null) {
     const query = `
-      SELECT c.*, 
-             COUNT(l.id) as lesson_count
-      FROM courses c
-      LEFT JOIN lessons l ON c.id = l.course_id
-      WHERE c.id = $1
-      GROUP BY c.id
+        SELECT
+            c.*, 
+            -- Aggregate lessons with their dependency requirements
+            JSON_AGG(
+                JSON_BUILD_OBJECT(
+                    'id', l.id,
+                    'title', l.title,
+                    'description', l.description,
+                    'order_index', l.order_index,
+                    'estimated_duration', l.estimated_duration,
+                    'is_optional', l.is_optional,
+                    
+                    -- User Progress Fields
+                    'is_completed', up.completed,
+                    'user_score', up.score,
+                    
+                    -- Lesson Dependencies
+                    'dependencies', (
+                        SELECT 
+                            JSON_AGG(
+                                JSON_BUILD_OBJECT(
+                                    'required_lesson_id', ld.required_lesson_id,
+                                    'required_achievement_type', ld.required_achievement_type,
+                                    'min_score', ld.min_score,
+                                    'dependency_type', ld.dependency_type
+                                )
+                            )
+                        FROM lesson_dependencies ld
+                        WHERE ld.lesson_id = l.id
+                    ),
+                    
+                    -- Check if the REQUIRED lesson is complete (basic check, frontend must complete the full logic)
+                    'required_lesson_completed', EXISTS(
+                        SELECT 1
+                        FROM lesson_dependencies ld_check
+                        JOIN user_progress up_check ON up_check.lesson_id = ld_check.required_lesson_id
+                        WHERE ld_check.lesson_id = l.id
+                        AND up_check.user_id = $2
+                        AND up_check.completed = true
+                        AND ld_check.dependency_type = 'lesson'
+                    )
+                ) ORDER BY l.order_index ASC
+            ) FILTER (WHERE l.id IS NOT NULL) AS lessons, -- FILTER ensures no lessons array for courses with no lessons
+            
+            -- Course Progress Summary
+            (SELECT COUNT(*) FROM lessons l2 WHERE l2.course_id = c.id) AS total_lessons,
+            (
+                SELECT COUNT(*)
+                FROM user_progress up3
+                JOIN lessons l3 ON up3.lesson_id = l3.id
+                WHERE up3.user_id = $2 AND up3.completed = true AND l3.course_id = c.id
+            ) AS completed_lessons,
+
+            -- User's Achievements (needed for achievement dependencies)
+            (
+                SELECT JSON_AGG(ua.achievement_type)
+                FROM user_achievements ua
+                WHERE ua.user_id = $2
+            ) AS user_achievements
+
+        FROM courses c
+        LEFT JOIN lessons l ON c.id = l.course_id
+        -- Use LEFT JOIN to include courses even without progress for the user
+        LEFT JOIN user_progress up ON l.id = up.lesson_id AND up.user_id = $2
+        WHERE c.id = $1
+        GROUP BY c.id
     `;
-    const result = await pool.query(query, [id]);
+    
+    const result = await pool.query(query, [id, userId]);
     return result.rows[0];
+  }
+
+  static async checkDependencies(courseId, userId) {
+    const query = `
+      SELECT cd.*, 
+             rc.title as required_course_title,
+             at.title as required_achievement_title
+      FROM course_dependencies cd
+      LEFT JOIN courses rc ON cd.required_course_id = rc.id
+      LEFT JOIN achievement_types at ON cd.required_achievement_type = at.type
+      WHERE cd.course_id = $1
+    `;
+    
+    const result = await pool.query(query, [courseId]);
+    const dependencies = result.rows;
+    
+    const unmet = [];
+    const met = [];
+
+    for (const dep of dependencies) {
+      let isMet = false;
+      
+      if (dep.dependency_type === 'course' && dep.required_course_id) {
+        // Check if required course is completed with min score
+        const progressQuery = `
+          SELECT MAX(up.score) as max_score
+          FROM user_progress up
+          JOIN lessons l ON up.lesson_id = l.id
+          WHERE up.user_id = $1 AND l.course_id = $2 AND up.completed = true
+        `;
+        const progressResult = await pool.query(progressQuery, [userId, dep.required_course_id]);
+        isMet = progressResult.rows[0]?.max_score >= dep.min_score;
+      } else if (dep.dependency_type === 'achievement' && dep.required_achievement_type) {
+        // Check if achievement is earned
+        const achievementQuery = `
+          SELECT 1 FROM user_achievements 
+          WHERE user_id = $1 AND achievement_type = $2
+        `;
+        const achievementResult = await pool.query(achievementQuery, [userId, dep.required_achievement_type]);
+        isMet = achievementResult.rows.length > 0;
+      }
+
+      if (isMet) {
+        met.push(dep);
+      } else {
+        unmet.push(dep);
+      }
+    }
+
+    return {
+      all_met: unmet.length === 0,
+      met_dependencies: met,
+      unmet_dependencies: unmet
+    };
+  }
+
+  static async getAvailableCourses(userId) {
+    const allCourses = await Course.findAll();
+    const availableCourses = [];
+
+    for (const course of allCourses) {
+      const dependencies = await Course.checkDependencies(course.id, userId);
+      const courseWithLessons = await Course.findById(course.id, userId);
+      
+      availableCourses.push({
+        ...course,
+        ...courseWithLessons,
+        dependencies,
+        is_locked: !dependencies.all_met,
+        completion_percentage: courseWithLessons.total_lessons > 0 
+          ? Math.round((courseWithLessons.completed_lessons / courseWithLessons.total_lessons) * 100)
+          : 0
+      });
+    }
+
+    return availableCourses;
   }
 
   static async findByIdWithDependencies(id, userId) {
@@ -294,6 +468,5 @@ class Course {
     };
   }
 }
-
 
 export default Course;

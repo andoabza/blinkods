@@ -7,7 +7,8 @@ const router = express.Router();
 // Lesson routes with dependencies
 router.get('/:lessonId', auth, LessonController.getLesson);
 router.get('/:lessonId/dependencies', auth, LessonController.checkDependencies);
-router.get('/:lessonId/navigation', auth, LessonController.getLessonNavigation);
+router.get('/:lessonId/navigation', auth, LessonController.getNavigation);
+router.post('/:lessonId/save', auth, LessonController.saveCode);
 router.post('/:lessonId/submit', auth, LessonController.submitLesson);
 router.post('/:lessonId/unlock', auth, LessonController.unlockLesson);
 

@@ -12,6 +12,7 @@ import Login from './pages/Login';
 import Register from './pages/Register';
 import ParentDashboard from './pages/ParentDashboard';
 import './App.css';
+import Courses from './pages/Course';
 
 function App() {
   return (
@@ -34,9 +35,24 @@ function App() {
                     <Lesson />
                   </ProtectedRoute>
                 } />
+
+                <Route 
+        path="/admin/create-course" 
+        element={
+        <ProtectedRoute> 
+          <CourseCreator /> 
+        </ProtectedRoute>
+        } />
+
+
                 <Route path="/achievements" element={
                 <ProtectedRoute>
                   <Achievements />
+                </ProtectedRoute>
+              } />
+              <Route path="/courses" element={
+                <ProtectedRoute>
+                  <Courses />
                 </ProtectedRoute>
               } />
               <Route path="/course/:courseId" element={

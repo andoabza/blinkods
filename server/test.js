@@ -1,864 +1,1064 @@
-import pool from "./config/database.js";
+import pool from '../config/database.js';
 
-  async function seedSampleLessons() {
+class Course {
+  static async findAll(filters = {}) {
+    let query = `
+      SELECT c.*, 
+             COUNT(l.id) as lesson_count,
+             COALESCE(AVG(up.score), 0) as average_rating
+      FROM courses c
+      LEFT JOIN lessons l ON c.id = l.course_id
+      LEFT JOIN user_progress up ON l.id = up.lesson_id AND up.completed = true
+    `;
+    
+    const values = [];
+    const conditions = [];
+    
+    if (filters.age_group) {
+      conditions.push(`c.age_group = $${values.length + 1}`);
+      values.push(filters.age_group);
+    }
+    
+    if (filters.language_target) {
+      conditions.push(`c.language_target = $${values.length + 1}`);
+      values.push(filters.language_target);
+    }
+    
+    if (filters.coding_language) {
+      conditions.push(`c.coding_language = $${values.length + 1}`);
+      values.push(filters.coding_language);
+    }
+    
+    if (conditions.length > 0) {
+      query += ` WHERE ${conditions.join(' AND ')}`;
+    }
+    
+    query += ` GROUP BY c.id ORDER BY c.id ASC`;
+    
+    const result = await pool.query(query, values);
+    return result.rows;
+  }
+
+  // static async findById(id, userId = null) {
+  //   const query = `
+  //     SELECT c.*, 
+  //            JSON_AGG(
+  //              JSON_BUILD_OBJECT(
+  //                'id', l.id,
+  //                'title', l.title,
+  //                'description', l.description,
+  //                'order_index', l.order_index,
+  //                'estimated_duration', l.estimated_duration,
+  //                'is_completed', EXISTS(
+  //                  SELECT 1 FROM user_progress up 
+  //                  WHERE up.lesson_id = l.id AND up.user_id = $2 AND up.completed = true
+  //                ),
+  //                'user_score', (
+  //                  SELECT up.score FROM user_progress up 
+  //                  WHERE up.lesson_id = l.id AND up.user_id = $2
+  //                )
+  //              ) ORDER BY l.order_index ASC
+  //            ) as lessons,
+  //            (
+  //              SELECT COUNT(*) FROM lessons l2 WHERE l2.course_id = c.id
+  //            ) as total_lessons,
+  //            (
+  //              SELECT COUNT(*) FROM user_progress up
+  //              JOIN lessons l3 ON up.lesson_id = l3.id
+  //              WHERE up.user_id = $2 AND up.completed = true AND l3.course_id = c.id
+  //            ) as completed_lessons
+  //     FROM courses c
+  //     LEFT JOIN lessons l ON c.id = l.course_id
+  //     WHERE c.id = $1
+  //     GROUP BY c.id
+  //   `;
+    
+  //   const result = await pool.query(query, [id, userId]);
+  //   return result.rows[0];
+  // }
+static async findById(id, userId = null) {
+    const query = `
+        SELECT
+            c.*, 
+            -- Aggregate lessons with their dependency requirements
+            JSON_AGG(
+                JSON_BUILD_OBJECT(
+                    'id', l.id,
+                    'title', l.title,
+                    'description', l.description,
+                    'order_index', l.order_index,
+                    'estimated_duration', l.estimated_duration,
+                    'is_optional', l.is_optional,
+                    
+                    -- User Progress Fields
+                    'is_completed', up.completed,
+                    'user_score', up.score,
+                    
+                    -- Lesson Dependencies
+                    'dependencies', (
+                        SELECT 
+                            JSON_AGG(
+                                JSON_BUILD_OBJECT(
+                                    'required_lesson_id', ld.required_lesson_id,
+                                    'required_achievement_type', ld.required_achievement_type,
+                                    'min_score', ld.min_score,
+                                    'dependency_type', ld.dependency_type
+                                )
+                            )
+                        FROM lesson_dependencies ld
+                        WHERE ld.lesson_id = l.id
+                    ),
+                    
+                    -- Check if the REQUIRED lesson is complete (basic check, frontend must complete the full logic)
+                    'required_lesson_completed', EXISTS(
+                        SELECT 1
+                        FROM lesson_dependencies ld_check
+                        JOIN user_progress up_check ON up_check.lesson_id = ld_check.required_lesson_id
+                        WHERE ld_check.lesson_id = l.id
+                        AND up_check.user_id = $2
+                        AND up_check.completed = true
+                        AND ld_check.dependency_type = 'lesson'
+                    )
+                ) ORDER BY l.order_index ASC
+            ) FILTER (WHERE l.id IS NOT NULL) AS lessons, -- FILTER ensures no lessons array for courses with no lessons
+            
+            -- Course Progress Summary
+            (SELECT COUNT(*) FROM lessons l2 WHERE l2.course_id = c.id) AS total_lessons,
+            (
+                SELECT COUNT(*)
+                FROM user_progress up3
+                JOIN lessons l3 ON up3.lesson_id = l3.id
+                WHERE up3.user_id = $2 AND up3.completed = true AND l3.course_id = c.id
+            ) AS completed_lessons,
+
+            -- User's Achievements (needed for achievement dependencies)
+            (
+                SELECT JSON_AGG(ua.achievement_type)
+                FROM user_achievements ua
+                WHERE ua.user_id = $2
+            ) AS user_achievements
+
+        FROM courses c
+        LEFT JOIN lessons l ON c.id = l.course_id
+        -- Use LEFT JOIN to include courses even without progress for the user
+        LEFT JOIN user_progress up ON l.id = up.lesson_id AND up.user_id = $2
+        WHERE c.id = $1
+        GROUP BY c.id
+    `;
+    
+    const result = await pool.query(query, [id, userId]);
+    return result.rows[0];
+  }
+
+  static async checkDependencies(courseId, userId) {
+    const query = `
+      SELECT cd.*, 
+             rc.title as required_course_title,
+             at.title as required_achievement_title
+      FROM course_dependencies cd
+      LEFT JOIN courses rc ON cd.required_course_id = rc.id
+      LEFT JOIN achievement_types at ON cd.required_achievement_type = at.type
+      WHERE cd.course_id = $1
+    `;
+    
+    const result = await pool.query(query, [courseId]);
+    const dependencies = result.rows;
+    
+    const unmet = [];
+    const met = [];
+
+    for (const dep of dependencies) {
+      let isMet = false;
+      
+      if (dep.dependency_type === 'course' && dep.required_course_id) {
+        // Check if required course is completed with min score
+        const progressQuery = `
+          SELECT MAX(up.score) as max_score
+          FROM user_progress up
+          JOIN lessons l ON up.lesson_id = l.id
+          WHERE up.user_id = $1 AND l.course_id = $2 AND up.completed = true
+        `;
+        const progressResult = await pool.query(progressQuery, [userId, dep.required_course_id]);
+        isMet = progressResult.rows[0]?.max_score >= dep.min_score;
+      } else if (dep.dependency_type === 'achievement' && dep.required_achievement_type) {
+        // Check if achievement is earned
+        const achievementQuery = `
+          SELECT 1 FROM user_achievements 
+          WHERE user_id = $1 AND achievement_type = $2
+        `;
+        const achievementResult = await pool.query(achievementQuery, [userId, dep.required_achievement_type]);
+        isMet = achievementResult.rows.length > 0;
+      }
+
+      if (isMet) {
+        met.push(dep);
+      } else {
+        unmet.push(dep);
+      }
+    }
+
+    return {
+      all_met: unmet.length === 0,
+      met_dependencies: met,
+      unmet_dependencies: unmet
+    };
+  }
+
+  static async getAvailableCourses(userId) {
+    const allCourses = await Course.findAll();
+    const availableCourses = [];
+
+    for (const course of allCourses) {
+      const dependencies = await Course.checkDependencies(course.id, userId);
+      const courseWithLessons = await Course.findById(course.id, userId);
+      
+      availableCourses.push({
+        ...course,
+        ...courseWithLessons,
+        dependencies,
+        is_locked: !dependencies.all_met,
+        completion_percentage: courseWithLessons.total_lessons > 0 
+          ? Math.round((courseWithLessons.completed_lessons / courseWithLessons.total_lessons) * 100)
+          : 0
+      });
+    }
+
+    return availableCourses;
+  }
+
+  static async findByIdWithDependencies(id, userId) {
+    const query = `
+      SELECT c.*, 
+             JSON_AGG(
+               JSON_BUILD_OBJECT(
+                 'id', l.id,
+                 'title', l.title,
+                 'description', l.description,
+                 'order_index', l.order_index,
+                 'is_completed', EXISTS(
+                   SELECT 1 FROM user_progress up 
+                   WHERE up.lesson_id = l.id AND up.user_id = $2 AND up.completed = true
+                 )
+               ) ORDER BY l.order_index
+             ) as lessons,
+             (
+               SELECT JSON_AGG(
+                 JSON_BUILD_OBJECT(
+                   'type', cd.dependency_type,
+                   'required_course_id', cd.required_course_id,
+                   'required_achievement_type', cd.required_achievement_type,
+                   'min_score', cd.min_score,
+                   'required_course_title', rc.title,
+                   'required_achievement_title', at.title
+                 )
+               )
+               FROM course_dependencies cd
+               LEFT JOIN courses rc ON cd.required_course_id = rc.id
+               LEFT JOIN achievement_types at ON cd.required_achievement_type = at.type
+               WHERE cd.course_id = c.id
+             ) as dependencies
+      FROM courses c
+      LEFT JOIN lessons l ON c.id = l.course_id
+      WHERE c.id = $1
+      GROUP BY c.id
+    `;
+    
+    const result = await pool.query(query, [id, userId]);
+    return result.rows[0];
+  }
+
+  static async getLesson(lessonId, userId = null) {
+    const query = `
+      SELECT l.*, c.title as course_title, c.language_target, c.coding_language,
+             c.id as course_id,
+             EXISTS(
+               SELECT 1 FROM user_progress up 
+               WHERE up.lesson_id = l.id AND up.user_id = $2 AND up.completed = true
+             ) as is_completed
+      FROM lessons l
+      JOIN courses c ON l.course_id = c.id
+      WHERE l.id = $1
+    `;
+    const result = await pool.query(query, [lessonId, userId]);
+    return result.rows[0];
+  }
+
+  static async checkCourseDependencies(courseId, userId) {
+    const dependenciesQuery = `
+      SELECT cd.*, 
+             rc.title as required_course_title, 
+             at.title as required_achievement_title,
+             at.description as required_achievement_description
+      FROM course_dependencies cd
+      LEFT JOIN courses rc ON cd.required_course_id = rc.id
+      LEFT JOIN achievement_types at ON cd.required_achievement_type = at.type
+      WHERE cd.course_id = $1
+    `;
+    
+    const dependenciesResult = await pool.query(dependenciesQuery, [courseId]);
+    const dependencies = dependenciesResult.rows;
+    
+    const unmetDependencies = [];
+    const metDependencies = [];
+
+    for (const dep of dependencies) {
+      let isMet = false;
+      let userProgress = null;
+      let currentValue = null;
+
+      if (dep.dependency_type === 'course' && dep.required_course_id) {
+        // Check course completion with minimum score
+        const progressQuery = `
+          SELECT 
+            COUNT(DISTINCT l.id) as total_lessons,
+            COUNT(up.lesson_id) as completed_lessons,
+            AVG(up.score) as average_score,
+            MAX(up.score) as max_score
+          FROM lessons l
+          LEFT JOIN user_progress up ON l.id = up.lesson_id AND up.user_id = $1 AND up.completed = true
+          WHERE l.course_id = $2
+          GROUP BY l.course_id
+        `;
+        
+        const progressResult = await pool.query(progressQuery, [userId, dep.required_course_id]);
+        userProgress = progressResult.rows[0];
+        
+        if (userProgress) {
+          currentValue = userProgress.max_score || 0;
+          isMet = currentValue >= dep.min_score;
+        } else {
+          currentValue = 0;
+          isMet = false;
+        }
+        
+      } else if (dep.dependency_type === 'achievement' && dep.required_achievement_type) {
+        // Check achievement
+        const achievementQuery = `
+          SELECT 1 FROM user_achievements 
+          WHERE user_id = $1 AND achievement_type = $2
+        `;
+        
+        const achievementResult = await pool.query(achievementQuery, [userId, dep.required_achievement_type]);
+        isMet = achievementResult.rows.length > 0;
+        currentValue = isMet ? 'Earned' : 'Not Earned';
+      }
+
+      const dependencyInfo = {
+        ...dep,
+        is_met: isMet,
+        user_progress: userProgress,
+        current_value: currentValue
+      };
+
+      if (isMet) {
+        metDependencies.push(dependencyInfo);
+      } else {
+        unmetDependencies.push(dependencyInfo);
+      }
+    }
+
+    return {
+      all_met: unmetDependencies.length === 0,
+      met_dependencies: metDependencies,
+      unmet_dependencies: unmetDependencies,
+      total_dependencies: dependencies.length,
+      met_count: metDependencies.length,
+      unmet_count: unmetDependencies.length
+    };
+  }
+
+  static async getAvailableCourses(userId) {
     try {
-      console.log('Seeding sample lessons with dependencies...');
+      // First, get all courses
+      const allCourses = await Course.findAll();
+      const availableCourses = [];
 
-      // Get course IDs for reference
-      const courseResult = await pool.query('SELECT id, title FROM courses ORDER BY id');
-      const courses = courseResult.rows.reduce((acc, course) => {
-        acc[course.title] = course.id;
-        return acc;
-      }, {});
-
-      // Sample lessons data with dependencies
-      const lessonsData = [
-        // Course 1: Intro to English with Blockly (4-7 years)
-        {
-          course_id: courses['Intro to English with Blockly'],
-          title: 'Hello, Colors!',
-          description: 'Learn basic colors in English while creating colorful block patterns',
-          instructions: {
-            en: 'Drag and connect the color blocks to create a rainbow pattern. Say each color out loud!',
-            spanish: 'Arrastra y conecta los bloques de color para crear un patrón de arcoíris. ¡Di cada color en voz alta!'
-          },
-          order_index: 1,
-          coding_challenge: `
-            <xml xmlns="https://developers.google.com/blockly/xml">
-              <block type="colour_picker" x="100" y="100">
-                <field name="COLOUR">#FF0000</field>
-              </block>
-            </xml>
-          `,
-          vocabulary: {
-            words: [
-              { word: "red", translation: "rojo", audio_url: "/audio/red.mp3" },
-              { word: "blue", translation: "azul", audio_url: "/audio/blue.mp3" },
-              { word: "green", translation: "verde", audio_url: "/audio/green.mp3" },
-              { word: "yellow", translation: "amarillo", audio_url: "/audio/yellow.mp3" }
-            ]
-          },
-          expected_output: "Rainbow pattern created",
-          is_optional: false,
-          estimated_duration: 600
-        },
-        {
-          course_id: courses['Intro to English with Blockly'],
-          title: 'Animal Friends',
-          description: 'Meet animal friends and learn their names in English',
-          instructions: {
-            en: 'Connect the animal blocks to make them appear on screen. Practice saying each animal name!',
-            spanish: 'Conecta los bloques de animales para hacer que aparezcan en la pantalla. ¡Practica diciendo cada nombre de animal!'
-          },
-          order_index: 2,
-          coding_challenge: `
-            <xml xmlns="https://developers.google.com/blockly/xml">
-              <block type="controls_repeat_ext" x="100" y="100">
-                <value name="TIMES">
-                  <block type="math_number">
-                    <field name="NUM">3</field>
-                  </block>
-                </value>
-                <statement name="DO">
-                  <block type="animal_show">
-                    <field name="ANIMAL">cat</field>
-                  </block>
-                </statement>
-              </block>
-            </xml>
-          `,
-          vocabulary: {
-            words: [
-              { word: "cat", translation: "gato", audio_url: "/audio/cat.mp3" },
-              { word: "dog", translation: "perro", audio_url: "/audio/dog.mp3" },
-              { word: "bird", translation: "pájaro", audio_url: "/audio/bird.mp3" },
-              { word: "fish", translation: "pez", audio_url: "/audio/fish.mp3" }
-            ]
-          },
-          expected_output: "Animals displayed 3 times",
-          is_optional: false,
-          estimated_duration: 720
-        },
-        {
-          course_id: courses['Intro to English with Blockly'],
-          title: 'Counting Fun',
-          description: 'Learn numbers 1-10 in English through interactive counting games',
-          instructions: {
-            en: 'Use the number blocks to count from 1 to 10. Listen to the pronunciation of each number!',
-            spanish: 'Usa los bloques numéricos para contar del 1 al 10. ¡Escucha la pronunciación de cada número!'
-          },
-          order_index: 3,
-          coding_challenge: `
-            <xml xmlns="https://developers.google.com/blockly/xml">
-              <block type="controls_for" x="100" y="100">
-                <field name="VAR">i</field>
-                <value name="FROM">
-                  <block type="math_number">
-                    <field name="NUM">1</field>
-                  </block>
-                </value>
-                <value name="TO">
-                  <block type="math_number">
-                    <field name="NUM">5</field>
-                  </block>
-                </value>
-                <value name="BY">
-                  <block type="math_number">
-                    <field name="NUM">1</field>
-                  </block>
-                </value>
-                <statement name="DO">
-                  <block type="text_print">
-                    <value name="TEXT">
-                      <block type="variables_get">
-                        <field name="VAR">i</field>
-                      </block>
-                    </value>
-                  </block>
-                </statement>
-              </block>
-            </xml>
-          `,
-          vocabulary: {
-            words: [
-              { word: "one", translation: "uno", audio_url: "/audio/one.mp3" },
-              { word: "two", translation: "dos", audio_url: "/audio/two.mp3" },
-              { word: "three", translation: "tres", audio_url: "/audio/three.mp3" },
-              { word: "four", translation: "cuatro", audio_url: "/audio/four.mp3" },
-              { word: "five", translation: "cinco", audio_url: "/audio/five.mp3" }
-            ]
-          },
-          expected_output: "1\n2\n3\n4\n5",
-          is_optional: false,
-          estimated_duration: 900
-        },
-
-        // Course 2: English Adventures: Stories & Code (8-12 years)
-        {
-          course_id: courses['English Adventures: Stories & Code'],
-          title: 'The Magic Forest',
-          description: 'Create an interactive story about exploring a magical forest',
-          instructions: {
-            en: 'Write a Python program that tells a story about exploring a magic forest. Use variables to track your adventure!',
-            spanish: 'Escribe un programa en Python que cuente una historia sobre explorar un bosque mágico. ¡Usa variables para seguir tu aventura!'
-          },
-          order_index: 1,
-          coding_challenge: `# Create your magic forest adventure story
-forest_name = "Enchanted Woods"
-character = "brave explorer"
-magical_item = "glowing crystal"
-
-print(f"Welcome to the {forest_name}!")
-print(f"You are a {character} with a {magical_item}.")`,
-          vocabulary: {
-            words: [
-              { word: "forest", translation: "bosque", audio_url: "/audio/forest.mp3" },
-              { word: "adventure", translation: "aventura", audio_url: "/audio/adventure.mp3" },
-              { word: "magical", translation: "mágico", audio_url: "/audio/magical.mp3" },
-              { word: "explore", translation: "explorar", audio_url: "/audio/explore.mp3" }
-            ]
-          },
-          expected_output: "Welcome to the Enchanted Woods!\nYou are a brave explorer with a glowing crystal.",
-          is_optional: false,
-          estimated_duration: 1200
-        },
-        {
-          course_id: courses['English Adventures: Stories & Code'],
-          title: 'Character Conversations',
-          description: 'Make story characters talk to each other using Python input/output',
-          instructions: {
-            en: 'Create a conversation between two characters. Use input() to let the user participate in the story!',
-            spanish: 'Crea una conversación entre dos personajes. ¡Usa input() para permitir que el usuario participe en la historia!'
-          },
-          order_index: 2,
-          coding_challenge: `# Create a character conversation
-character1 = "Wise Owl"
-character2 = "Curious Rabbit"
-
-print(f"{character1}: Who goes there?")
-response = input("Enter your name: ")
-print(f"{character2}: Hello {response}! Welcome to our forest!")`,
-          vocabulary: {
-            words: [
-              { word: "conversation", translation: "conversación", audio_url: "/audio/conversation.mp3" },
-              { word: "character", translation: "personaje", audio_url: "/audio/character.mp3" },
-              { word: "dialogue", translation: "diálogo", audio_url: "/audio/dialogue.mp3" },
-              { word: "interactive", translation: "interactivo", audio_url: "/audio/interactive.mp3" }
-            ]
-          },
-          expected_output: "Wise Owl: Who goes there?\n[User input]\nCurious Rabbit: Hello [input]! Welcome to our forest!",
-          is_optional: false,
-          estimated_duration: 1500
-        },
-        {
-          course_id: courses['English Adventures: Stories & Code'],
-          title: 'Story Choices',
-          description: 'Create branching story paths with conditional statements',
-          instructions: {
-            en: 'Use if/else statements to create different story paths based on user choices',
-            spanish: 'Usa declaraciones if/else para crear diferentes caminos de historia basados en las elecciones del usuario'
-          },
-          order_index: 3,
-          coding_challenge: `# Create a branching story
-print("You reach a fork in the path.")
-print("1. Take the left path")
-print("2. Take the right path")
-
-choice = input("Enter your choice (1 or 2): ")
-
-if choice == "1":
-    print("You discover a hidden waterfall!")
-else:
-    print("You find a treasure chest!")`,
-          vocabulary: {
-            words: [
-              { word: "choice", translation: "elección", audio_url: "/audio/choice.mp3" },
-              { word: "decision", translation: "decisión", audio_url: "/audio/decision.mp3" },
-              { word: "branching", translation: "ramificación", audio_url: "/audio/branching.mp3" },
-              { word: "conditional", translation: "condicional", audio_url: "/audio/conditional.mp3" }
-            ]
-          },
-          expected_output: "You reach a fork in the path.\n1. Take the left path\n2. Take the right path\n[User input]\n[Path description based on choice]",
-          is_optional: false,
-          estimated_duration: 1800
-        },
-
-        // Course 3: Everyday English for Teens (13-17 years)
-        {
-          course_id: courses['Everyday English for Teens'],
-          title: 'Weather App',
-          description: 'Build a simple weather application while learning weather vocabulary',
-          instructions: {
-            en: 'Create a JavaScript function that displays weather information based on user input',
-            spanish: 'Crea una función en JavaScript que muestre información del clima basada en la entrada del usuario'
-          },
-          order_index: 1,
-          coding_challenge: `// Weather vocabulary practice
-const weatherWords = {
-  sunny: "soleado",
-  rainy: "lluvioso", 
-  cloudy: "nublado",
-  windy: "ventoso"
-};
-
-function getWeatherDescription(weatherType) {
-  return \`The weather is \${weatherType} - \${weatherWords[weatherType]}\`;
-}
-
-// Test the function
-console.log(getWeatherDescription("sunny"));`,
-          vocabulary: {
-            words: [
-              { word: "weather", translation: "clima", audio_url: "/audio/weather.mp3" },
-              { word: "temperature", translation: "temperatura", audio_url: "/audio/temperature.mp3" },
-              { word: "forecast", translation: "pronóstico", audio_url: "/audio/forecast.mp3" },
-              { word: "conditions", translation: "condiciones", audio_url: "/audio/conditions.mp3" }
-            ]
-          },
-          expected_output: "The weather is sunny - soleado",
-          is_optional: false,
-          estimated_duration: 1500
-        },
-        {
-          course_id: courses['Everyday English for Teens'],
-          title: 'Shopping List Manager',
-          description: 'Create a shopping list application with English food vocabulary',
-          instructions: {
-            en: 'Build a shopping list manager that uses arrays and objects to store items in both English and Spanish',
-            spanish: 'Construye un administrador de lista de compras que use arrays y objetos para almacenar items en inglés y español'
-          },
-          order_index: 2,
-          coding_challenge: `// Shopping list with bilingual support
-const shoppingItems = [
-  { english: "apple", spanish: "manzana", category: "fruit" },
-  { english: "bread", spanish: "pan", category: "bakery" },
-  { english: "milk", spanish: "leche", category: "dairy" }
-];
-
-function displayShoppingList() {
-  shoppingItems.forEach(item => {
-    console.log(\`\${item.english} / \${item.spanish} - \${item.category}\`);
-  });
-}
-
-displayShoppingList();`,
-          vocabulary: {
-            words: [
-              { word: "grocery", translation: "supermercado", audio_url: "/audio/grocery.mp3" },
-              { word: "shopping", translation: "compras", audio_url: "/audio/shopping.mp3" },
-              { word: "list", translation: "lista", audio_url: "/audio/list.mp3" },
-              { word: "items", translation: "artículos", audio_url: "/audio/items.mp3" }
-            ]
-          },
-          expected_output: "apple / manzana - fruit\nbread / pan - bakery\nmilk / leche - dairy",
-          is_optional: false,
-          estimated_duration: 1800
-        },
-
-        // Course 4: Spanish Basics with Blockly (4-7 years)
-        {
-          course_id: courses['Spanish Basics with Blockly'],
-          title: '¡Hola Amigos!',
-          description: 'Learn basic Spanish greetings through block programming',
-          instructions: {
-            en: 'Connect greeting blocks to create a friendly conversation in Spanish',
-            spanish: 'Conecta los bloques de saludo para crear una conversación amigable en español'
-          },
-          order_index: 1,
-          coding_challenge: `
-            <xml xmlns="https://developers.google.com/blockly/xml">
-              <block type="text_join" x="100" y="100">
-                <mutation items="2"></mutation>
-                <value name="ADD0">
-                  <block type="text">
-                    <field name="TEXT">¡Hola! </field>
-                  </block>
-                </value>
-                <value name="ADD1">
-                  <block type="text">
-                    <field name="TEXT">¿Cómo estás?</field>
-                  </block>
-                </value>
-              </block>
-            </xml>
-          `,
-          vocabulary: {
-            words: [
-              { word: "hola", translation: "hello", audio_url: "/audio/hola.mp3" },
-              { word: "adiós", translation: "goodbye", audio_url: "/audio/adios.mp3" },
-              { word: "gracias", translation: "thank you", audio_url: "/audio/gracias.mp3" },
-              { word: "por favor", translation: "please", audio_url: "/audio/por_favor.mp3" }
-            ]
-          },
-          expected_output: "¡Hola! ¿Cómo estás?",
-          is_optional: false,
-          estimated_duration: 600
-        },
-        {
-          course_id: courses['Spanish Basics with Blockly'],
-          title: 'Números en Español',
-          description: 'Learn Spanish numbers 1-5 with counting games',
-          instructions: {
-            en: 'Use number blocks to count in Spanish and create simple math operations',
-            spanish: 'Usa bloques numéricos para contar en español y crear operaciones matemáticas simples'
-          },
-          order_index: 2,
-          coding_challenge: `
-            <xml xmlns="https://developers.google.com/blockly/xml">
-              <block type="math_arithmetic" x="100" y="100">
-                <field name="OP">ADD</field>
-                <value name="A">
-                  <block type="math_number">
-                    <field name="NUM">2</field>
-                  </block>
-                </value>
-                <value name="B">
-                  <block type="math_number">
-                    <field name="NUM">3</field>
-                  </block>
-                </value>
-              </block>
-            </xml>
-          `,
-          vocabulary: {
-            words: [
-              { word: "uno", translation: "one", audio_url: "/audio/uno.mp3" },
-              { word: "dos", translation: "two", audio_url: "/audio/dos.mp3" },
-              { word: "tres", translation: "three", audio_url: "/audio/tres.mp3" },
-              { word: "cuatro", translation: "four", audio_url: "/audio/cuatro.mp3" },
-              { word: "cinco", translation: "five", audio_url: "/audio/cinco.mp3" }
-            ]
-          },
-          expected_output: "5",
-          is_optional: false,
-          estimated_duration: 720
-        },
-
-        // Course 5: Spanish Storytelling and Code (8-12 years)
-        {
-          course_id: courses['Spanish Storytelling and Code'],
-          title: 'Cuento Interactivo',
-          description: 'Create an interactive Spanish story with Python',
-          instructions: {
-            en: 'Write a Python program that tells a story in Spanish with user interaction',
-            spanish: 'Escribe un programa en Python que cuente una historia en español con interacción del usuario'
-          },
-          order_index: 1,
-          coding_challenge: `# Cuento interactivo en español
-personaje = input("¿Cómo se llama tu personaje? ")
-lugar = "un castillo misterioso"
-
-print(f"Había una vez {personaje} que vivía en {lugar}.")
-print("Un día, {personaje} decidió explorar los pasillos secretos.")`,
-          vocabulary: {
-            words: [
-              { word: "cuento", translation: "story", audio_url: "/audio/cuento.mp3" },
-              { word: "personaje", translation: "character", audio_url: "/audio/personaje.mp3" },
-              { word: "aventura", translation: "adventure", audio_url: "/audio/aventura.mp3" },
-              { word: "historia", translation: "history/story", audio_url: "/audio/historia.mp3" }
-            ]
-          },
-          expected_output: "[User input for character name]\nHabía una vez [character] que vivía en un castillo misterioso.\nUn día, [character] decidió explorar los pasillos secretos.",
-          is_optional: false,
-          estimated_duration: 1500
-        },
-
-        // Course 6: French Fun with Blocks (4-7 years)
-        {
-          course_id: courses['French Fun with Blocks'],
-          title: 'Bonjour les Couleurs!',
-          description: 'Learn French colors through block programming',
-          instructions: {
-            en: 'Create colorful patterns while learning French color names',
-            spanish: 'Crea patrones coloridos mientras aprendes los nombres de los colores en francés'
-          },
-          order_index: 1,
-          coding_challenge: `
-            <xml xmlns="https://developers.google.com/blockly/xml">
-              <block type="colour_blend" x="100" y="100">
-                <value name="COLOUR1">
-                  <block type="colour_picker">
-                    <field name="COLOUR">#FF0000</field>
-                  </block>
-                </value>
-                <value name="COLOUR2">
-                  <block type="colour_picker">
-                    <field name="COLOUR">#0000FF</field>
-                  </block>
-                </value>
-                <value name="RATIO">
-                  <block type="math_number">
-                    <field name="NUM">0.5</field>
-                  </block>
-                </value>
-              </block>
-            </xml>
-          `,
-          vocabulary: {
-            words: [
-              { word: "rouge", translation: "red", audio_url: "/audio/rouge.mp3" },
-              { word: "bleu", translation: "blue", audio_url: "/audio/bleu.mp3" },
-              { word: "vert", translation: "green", audio_url: "/audio/vert.mp3" },
-              { word: "jaune", translation: "yellow", audio_url: "/audio/jaune.mp3" }
-            ]
-          },
-          expected_output: "Color blend created",
-          is_optional: false,
-          estimated_duration: 600
-        },
-
-        // Course 7: French Labs: Coding & Conversation (13-17 years)
-        {
-          course_id: courses['French Labs: Coding & Conversation'],
-          title: 'Restaurant Simulator',
-          description: 'Build a restaurant ordering system in French',
-          instructions: {
-            en: 'Create a JavaScript application for a French restaurant with menu and ordering system',
-            spanish: 'Crea una aplicación en JavaScript para un restaurante francés con menú y sistema de pedidos'
-          },
-          order_index: 1,
-          coding_challenge: `// French restaurant simulator
-const menu = {
-  "croissant": 2.50,
-  "baguette": 1.80,
-  "quiche": 5.00,
-  "crêpe": 3.50
-};
-
-function commanderNourriture(plat, quantite) {
-  const prixTotal = menu[plat] * quantite;
-  return \`\${quantite} \${plat}(s) - €\${prixTotal.toFixed(2)}\`;
-}
-
-console.log("Menu du jour:");
-for (const [plat, prix] of Object.entries(menu)) {
-  console.log(\`\${plat}: €\${prix}\`);
-}`,
-          vocabulary: {
-            words: [
-              { word: "restaurant", translation: "restaurante", audio_url: "/audio/restaurant.mp3" },
-              { word: "commander", translation: "to order", audio_url: "/audio/commander.mp3" },
-              { word: "nourriture", translation: "food", audio_url: "/audio/nourriture.mp3" },
-              { word: "menu", translation: "menú", audio_url: "/audio/menu_fr.mp3" }
-            ]
-          },
-          expected_output: "Menu du jour:\ncroissant: €2.50\nbaguette: €1.80\nquiche: €5.00\ncrêpe: €3.50",
-          is_optional: false,
-          estimated_duration: 1800
-        },
-
-        // Course 8: German Basics for Kids (8-12 years)
-        {
-          course_id: courses['German Basics for Kids'],
-          title: 'Hallo Deutschland!',
-          description: 'Learn basic German greetings and introductions',
-          instructions: {
-            en: 'Create a Blockly program that introduces yourself in German',
-            spanish: 'Crea un programa Blockly que te presente en alemán'
-          },
-          order_index: 1,
-          coding_challenge: `
-            <xml xmlns="https://developers.google.com/blockly/xml">
-              <block type="text_join" x="100" y="100">
-                <mutation items="3"></mutation>
-                <value name="ADD0">
-                  <block type="text">
-                    <field name="TEXT">Hallo! </field>
-                  </block>
-                </value>
-                <value name="ADD1">
-                  <block type="text">
-                    <field name="TEXT">Ich heiße </field>
-                  </block>
-                </value>
-                <value name="ADD2">
-                  <block type="text">
-                    <field name="TEXT">[Name]</field>
-                  </block>
-                </value>
-              </block>
-            </xml>
-          `,
-          vocabulary: {
-            words: [
-              { word: "Hallo", translation: "Hello", audio_url: "/audio/hallo.mp3" },
-              { word: "Guten Tag", translation: "Good day", audio_url: "/audio/guten_tag.mp3" },
-              { word: "Auf Wiedersehen", translation: "Goodbye", audio_url: "/audio/auf_wiedersehen.mp3" },
-              { word: "Danke", translation: "Thank you", audio_url: "/audio/danke.mp3" }
-            ]
-          },
-          expected_output: "Hallo! Ich heiße [Name]",
-          is_optional: false,
-          estimated_duration: 900
-        },
-
-        // Course 9: Mandarin Starter Projects (8-12 years)
-        {
-          course_id: courses['Mandarin Starter Projects'],
-          title: 'Numbers in Mandarin',
-          description: 'Learn to count and use numbers in Mandarin Chinese',
-          instructions: {
-            en: 'Create a Python program that teaches Mandarin numbers 1-10',
-            spanish: 'Crea un programa en Python que enseñe los números del 1-10 en mandarín'
-          },
-          order_index: 1,
-          coding_challenge: `# Mandarin numbers practice
-mandarin_numbers = {
-  1: "一 (yī)",
-  2: "二 (èr)", 
-  3: "三 (sān)",
-  4: "四 (sì)",
-  5: "五 (wǔ)",
-  6: "六 (liù)",
-  7: "七 (qī)",
-  8: "八 (bā)",
-  9: "九 (jiǔ)",
-  10: "十 (shí)"
-}
-
-for number, character in mandarin_numbers.items():
-    print(f"{number}: {character}")`,
-          vocabulary: {
-            words: [
-              { word: "数字", translation: "numbers", audio_url: "/audio/shuzi.mp3" },
-              { word: "一", translation: "one", audio_url: "/audio/yi.mp3" },
-              { word: "二", translation: "two", audio_url: "/audio/er.mp3" },
-              { word: "三", translation: "three", audio_url: "/audio/san.mp3" }
-            ]
-          },
-          expected_output: "1: 一 (yī)\n2: 二 (èr)\n3: 三 (sān)\n4: 四 (sì)\n5: 五 (wǔ)\n6: 六 (liù)\n7: 七 (qī)\n8: 八 (bā)\n9: 九 (jiǔ)\n10: 十 (shí)",
-          is_optional: false,
-          estimated_duration: 1200
-        },
-
-        // Course 10: Multilingual Explorer (8-12 years)
-        {
-          course_id: courses['Multilingual Explorer'],
-          title: 'Greetings Around the World',
-          description: 'Learn greetings in multiple languages through coding',
-          instructions: {
-            en: 'Create a program that displays greetings in English, Spanish, and French',
-            spanish: 'Crea un programa que muestre saludos en inglés, español y francés'
-          },
-          order_index: 1,
-          coding_challenge: `
-            <xml xmlns="https://developers.google.com/blockly/xml">
-              <block type="controls_if" x="100" y="100">
-                <value name="IF0">
-                  <block type="logic_compare">
-                    <field name="OP">EQ</field>
-                    <value name="A">
-                      <block type="variables_get">
-                        <field name="VAR">language</field>
-                      </block>
-                    </value>
-                    <value name="B">
-                      <block type="text">
-                        <field name="TEXT">english</field>
-                      </block>
-                    </value>
-                  </block>
-                </value>
-                <statement name="DO0">
-                  <block type="text_print">
-                    <value name="TEXT">
-                      <block type="text">
-                        <field name="TEXT">Hello!</field>
-                      </block>
-                    </value>
-                  </block>
-                </statement>
-              </block>
-            </xml>
-          `,
-          vocabulary: {
-            words: [
-              { word: "greeting", translation: "saludo", audio_url: "/audio/greeting.mp3" },
-              { word: "language", translation: "idioma", audio_url: "/audio/language.mp3" },
-              { word: "multilingual", translation: "multilingüe", audio_url: "/audio/multilingual.mp3" },
-              { word: "culture", translation: "cultura", audio_url: "/audio/culture.mp3" }
-            ]
-          },
-          expected_output: "Hello! (when language is english)",
-          is_optional: false,
-          estimated_duration: 1500
-        },
-
-        // Course 11: Advanced Coding for Language Tutors (13-17 years)
-        {
-          course_id: courses['Advanced Coding for Language Tutors'],
-          title: 'Language Quiz App',
-          description: 'Build an advanced language learning quiz application',
-          instructions: {
-            en: 'Create a comprehensive language quiz with multiple question types and scoring system',
-            spanish: 'Crea un cuestionario de idiomas completo con múltiples tipos de preguntas y sistema de puntuación'
-          },
-          order_index: 1,
-          coding_challenge: `// Advanced language quiz application
-class LanguageQuiz {
-  constructor() {
-    this.questions = [
-      {
-        question: "How do you say 'hello' in Spanish?",
-        options: ["Hola", "Adiós", "Gracias", "Por favor"],
-        answer: "Hola",
-        language: "spanish"
-      },
-      {
-        question: "What is 'thank you' in French?",
-        options: ["Bonjour", "Merci", "Au revoir", "S'il vous plaît"],
-        answer: "Merci", 
-        language: "french"
-      }
-    ];
-    this.score = 0;
-  }
-
-  checkAnswer(questionIndex, userAnswer) {
-    return this.questions[questionIndex].answer === userAnswer;
-  }
-}
-
-// Test the quiz
-const quiz = new LanguageQuiz();
-console.log("Welcome to the Language Quiz!");`,
-          vocabulary: {
-            words: [
-              { word: "quiz", translation: "cuestionario", audio_url: "/audio/quiz.mp3" },
-              { word: "application", translation: "aplicación", audio_url: "/audio/application.mp3" },
-              { word: "advanced", translation: "avanzado", audio_url: "/audio/advanced.mp3" },
-              { word: "comprehensive", translation: "integral", audio_url: "/audio/comprehensive.mp3" }
-            ]
-          },
-          expected_output: "Welcome to the Language Quiz!",
-          is_optional: false,
-          estimated_duration: 2400
-        },
-
-        // Course 12: Game-Based Language Learning (8-12 years)
-        {
-          course_id: courses['Game-Based Language Learning'],
-          title: 'Vocabulary Memory Game',
-          description: 'Create a memory matching game with language vocabulary',
-          instructions: {
-            en: 'Build a memory game where players match words with their translations',
-            spanish: 'Construye un juego de memoria donde los jugadores emparejen palabras con sus traducciones'
-          },
-          order_index: 1,
-          coding_challenge: `# Vocabulary memory game
-import random
-
-# Word pairs: English - Spanish
-word_pairs = [
-    ["cat", "gato"],
-    ["dog", "perro"], 
-    ["house", "casa"],
-    ["water", "agua"]
-]
-
-# Create cards (each word appears twice)
-cards = []
-for english, spanish in word_pairs:
-    cards.extend([english, spanish])
-
-random.shuffle(cards)
-
-print("Memory Game Cards:")
-for i, card in enumerate(cards):
-    print(f"Card {i+1}: [ ? ]")`,
-          vocabulary: {
-            words: [
-              { word: "game", translation: "juego", audio_url: "/audio/game.mp3" },
-              { word: "memory", translation: "memoria", audio_url: "/audio/memory.mp3" },
-              { word: "match", translation: "emparejar", audio_url: "/audio/match.mp3" },
-              { word: "vocabulary", translation: "vocabulario", audio_url: "/audio/vocabulary.mp3" }
-            ]
-          },
-          expected_output: "Memory Game Cards:\nCard 1: [ ? ]\nCard 2: [ ? ]\n...",
-          is_optional: false,
-          estimated_duration: 1800
-        }
-      ];
-
-      // Insert lessons
-      const lessonIds = [];
-      for (const lesson of lessonsData) {
-        const query = `
-          INSERT INTO lessons (course_id, title, description, instructions, order_index, coding_challenge, vocabulary, expected_output, is_optional, estimated_duration)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-          RETURNING id
-        `;
-        const values = [
-          lesson.course_id,
-          lesson.title,
-          lesson.description,
-          JSON.stringify(lesson.instructions),
-          lesson.order_index,
-          lesson.coding_challenge,
-          JSON.stringify(lesson.vocabulary),
-          lesson.expected_output,
-          lesson.is_optional,
-          lesson.estimated_duration
-        ];
+      for (const course of allCourses) {
+        // Check dependencies for each course
+        const dependencies = await Course.checkCourseDependencies(course.id, userId);
         
-        const result = await pool.query(query, values);
-        lessonIds.push(result.rows[0].id);
-      }
-
-      // Create lesson dependencies
-      const dependencies = [
-        // Course 1 dependencies
-        {
-          lesson_id: lessonIds[1], // Animal Friends (requires Hello Colors)
-          required_lesson_id: lessonIds[0],
-          min_score: 70,
-          dependency_type: 'lesson'
-        },
-        {
-          lesson_id: lessonIds[2], // Counting Fun (requires Animal Friends)
-          required_lesson_id: lessonIds[1],
-          min_score: 80,
-          dependency_type: 'lesson'
-        },
-
-        // Course 2 dependencies
-        {
-          lesson_id: lessonIds[4], // Character Conversations (requires Magic Forest)
-          required_lesson_id: lessonIds[3],
-          min_score: 75,
-          dependency_type: 'lesson'
-        },
-        {
-          lesson_id: lessonIds[5], // Story Choices (requires Character Conversations + achievement)
-          required_lesson_id: lessonIds[4],
-          required_achievement_type: 'fast_learner',
-          min_score: 85,
-          dependency_type: 'achievement'
-        },
-
-        // Course 3 dependencies
-        {
-          lesson_id: lessonIds[7], // Shopping List Manager (requires Weather App)
-          required_lesson_id: lessonIds[6],
-          min_score: 80,
-          dependency_type: 'lesson'
-        },
-
-        // Course 4 dependencies
-        {
-          lesson_id: lessonIds[9], // Números en Español (requires ¡Hola Amigos!)
-          required_lesson_id: lessonIds[8],
-          min_score: 70,
-          dependency_type: 'lesson'
-        },
-
-        // Course 5 dependencies (Spanish Storytelling)
-        {
-          lesson_id: lessonIds[10], // Requires basic Spanish achievement
-          required_achievement_type: 'first_lesson',
-          min_score: 0,
-          dependency_type: 'achievement'
-        },
-
-        // Course 7 dependencies (French Labs)
-        {
-          lesson_id: lessonIds[12], // Restaurant Simulator requires basic French
-          required_achievement_type: 'language_explorer',
-          min_score: 0,
-          dependency_type: 'achievement'
-        },
-
-        // Course 11 dependencies (Advanced Coding)
-        {
-          lesson_id: lessonIds[16], // Language Quiz App requires multiple achievements
-          required_achievement_type: 'fast_learner',
-          min_score: 0,
-          dependency_type: 'achievement'
-        },
-
-        // Course 12 dependencies (Game-Based Learning)
-        {
-          lesson_id: lessonIds[17], // Vocabulary Memory Game requires basic programming
-          required_lesson_id: lessonIds[3], // From English Adventures course
-          min_score: 75,
-          dependency_type: 'lesson'
-        }
-      ];
-
-      for (const dep of dependencies) {
-        const query = `
-          INSERT INTO lesson_dependencies (lesson_id, required_lesson_id, required_achievement_type, min_score, dependency_type)
-          VALUES ($1, $2, $3, $4, $5)
-        `;
-        const values = [
-          dep.lesson_id,
-          dep.required_lesson_id || null,
-          dep.required_achievement_type || null,
-          dep.min_score,
-          dep.dependency_type
-        ];
+        // Get user progress for this course
+        const userProgress = await Course.getUserProgress(userId, course.id);
         
-        await pool.query(query, values);
+        if (dependencies.all_met) {
+          availableCourses.push({
+            ...course,
+            dependencies: dependencies,
+            is_locked: false,
+            user_progress: userProgress
+          });
+        } else {
+          availableCourses.push({
+            ...course,
+            dependencies: dependencies,
+            is_locked: true,
+            lock_reason: dependencies.unmet_dependencies[0], // First unmet dependency
+            user_progress: userProgress
+          });
+        }
       }
 
-      console.log(`Successfully seeded ${lessonsData.length} lessons with ${dependencies.length} dependencies`);
-      return lessonIds;
+      return availableCourses;
     } catch (error) {
-      console.error('Error seeding lessons:', error);
+      console.error('Error in getAvailableCourses:', error);
       throw error;
     }
   }
 
-  async function clearLessons() {
-    try {
-      await pool.query('DELETE FROM lesson_dependencies');
-      await pool.query('DELETE FROM lessons');
-      console.log('All lessons and dependencies cleared');
-    } catch (error) {
-      console.error('Error clearing lessons:', error);
-      throw error;
-    }
+  static async getUserProgress(userId, courseId) {
+    const query = `
+      SELECT 
+        COUNT(DISTINCT l.id) as total_lessons,
+        COUNT(DISTINCT CASE WHEN up.completed = true THEN up.lesson_id END) as completed_lessons,
+        COALESCE(AVG(CASE WHEN up.completed = true THEN up.score END), 0) as average_score,
+        COALESCE(SUM(up.time_spent), 0) as total_time_spent,
+        MAX(up.completed_at) as last_activity
+      FROM lessons l
+      LEFT JOIN user_progress up ON l.id = up.lesson_id AND up.user_id = $1
+      WHERE l.course_id = $2
+      GROUP BY l.course_id
+    `;
+    
+    const result = await pool.query(query, [userId, courseId]);
+    return result.rows[0] || { 
+      total_lessons: 0, 
+      completed_lessons: 0, 
+      average_score: 0, 
+      total_time_spent: 0,
+      last_activity: null
+    };
   }
 
+  static async create(courseData) {
+    const { title, description, language_target, coding_language, age_group, difficulty_level, thumbnail_url, order_index } = courseData;
+    const query = `
+      INSERT INTO courses (title, description, language_target, coding_language, age_group, difficulty_level, thumbnail_url, order_index)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      RETURNING *
+    `;
+    const values = [title, description, language_target, coding_language, age_group, difficulty_level, thumbnail_url, order_index];
+    
+    const result = await pool.query(query, values);
+    return result.rows[0];
+  }
 
-seedSampleLessons();
+  static async addDependency(courseId, dependencyData) {
+    const { required_course_id, required_achievement_type, min_score, dependency_type } = dependencyData;
+    const query = `
+      INSERT INTO course_dependencies (course_id, required_course_id, required_achievement_type, min_score, dependency_type)
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING *
+    `;
+    const values = [courseId, required_course_id, required_achievement_type, min_score, dependency_type];
+    
+    const result = await pool.query(query, values);
+    return result.rows[0];
+  }
+
+  static async getCourseWithProgress(userId, courseId) {
+    const course = await Course.findByIdWithDependencies(courseId, userId);
+    const progress = await Course.getUserProgress(userId, courseId);
+    
+    return {
+      ...course,
+      user_progress: progress,
+      completion_percentage: progress.total_lessons > 0 
+        ? Math.round((progress.completed_lessons / progress.total_lessons) * 100)
+        : 0
+    };
+  }
+}
+
+export default Course;
+
+import pool from "../config/database.js";
+
+class Lesson {
+
+  static async findById(lessonId, userId = null) {
+    const query = `
+      SELECT l.*, 
+             c.title as course_title,
+             c.language_target,
+             c.coding_language,
+             c.id as course_id,
+             EXISTS(
+               SELECT 1 FROM user_progress up 
+               WHERE up.lesson_id = l.id AND up.user_id = $2 AND up.completed = true
+             ) as is_completed,
+             (
+               SELECT up.score FROM user_progress up 
+               WHERE up.lesson_id = l.id AND up.user_id = $2
+             ) as user_score,
+             (
+               SELECT up.code_submission FROM user_progress up 
+               WHERE up.lesson_id = l.id AND up.user_id = $2
+             ) as user_code,
+             (
+               SELECT JSON_AGG(
+                 JSON_BUILD_OBJECT(
+                   'id', ld.id,
+                   'type', ld.dependency_type,
+                   'required_lesson_id', ld.required_lesson_id,
+                   'required_achievement_type', ld.required_achievement_type,
+                   'min_score', ld.min_score,
+                   'required_lesson_title', rl.title,
+                   'required_achievement_title', at.title
+                 )
+               )
+               FROM lesson_dependencies ld
+               LEFT JOIN lessons rl ON ld.required_lesson_id = rl.id
+               LEFT JOIN achievement_types at ON ld.required_achievement_type = at.type
+               WHERE ld.lesson_id = l.id
+             ) as dependencies
+      FROM lessons l
+      JOIN courses c ON l.course_id = c.id
+      WHERE l.id = $1
+    `;
+    
+    const result = await pool.query(query, [lessonId, userId]);
+    return result.rows[0];
+  }
+
+  static async checkDependencies(lessonId, userId) {
+    const query = `
+      SELECT ld.*, 
+             rl.title as required_lesson_title,
+             at.title as required_achievement_title
+      FROM lesson_dependencies ld
+      LEFT JOIN lessons rl ON ld.required_lesson_id = rl.id
+      LEFT JOIN achievement_types at ON ld.required_achievement_type = at.type
+      WHERE ld.lesson_id = $1
+    `;
+    
+    const result = await pool.query(query, [lessonId]);
+    const dependencies = result.rows;
+    
+    const unmet = [];
+    const met = [];
+
+    for (const dep of dependencies) {
+      let isMet = false;
+      let currentValue = null;
+
+      if (dep.dependency_type === 'lesson' && dep.required_lesson_id) {
+        // Check lesson completion with minimum score
+        const progressQuery = `
+          SELECT up.score, up.completed 
+          FROM user_progress up 
+          WHERE up.lesson_id = $1 AND up.user_id = $2
+        `;
+        const progressResult = await pool.query(progressQuery, [dep.required_lesson_id, userId]);
+        const progress = progressResult.rows[0];
+        
+        if (progress && progress.completed) {
+          currentValue = progress.score;
+          isMet = progress.score >= dep.min_score;
+        }
+      } else if (dep.dependency_type === 'achievement' && dep.required_achievement_type) {
+        // Check achievement
+        const achievementQuery = `
+          SELECT 1 FROM user_achievements 
+          WHERE user_id = $1 AND achievement_type = $2
+        `;
+        const achievementResult = await pool.query(achievementQuery, [userId, dep.required_achievement_type]);
+        isMet = achievementResult.rows.length > 0;
+        currentValue = isMet ? 'Earned' : 'Not Earned';
+      }
+
+      const dependencyInfo = {
+        ...dep,
+        is_met: isMet,
+        current_value: currentValue
+      };
+
+      if (isMet) {
+        met.push(dependencyInfo);
+      } else {
+        unmet.push(dependencyInfo);
+      }
+    }
+
+    return {
+      all_met: unmet.length === 0,
+      met_dependencies: met,
+      unmet_dependencies: unmet
+    };
+  }
+
+  static async getNavigation(courseId, currentLessonId, userId) {
+    // Get all lessons in course
+    const lessonsQuery = `
+      SELECT l.id, l.title, l.order_index,
+             EXISTS(
+               SELECT 1 FROM user_progress up 
+               WHERE up.lesson_id = l.id AND up.user_id = $2 AND up.completed = true
+             ) as is_completed
+      FROM lessons l
+      WHERE l.course_id = $1
+      ORDER BY l.order_index ASC
+    `;
+    
+    const lessonsResult = await pool.query(lessonsQuery, [courseId, userId]);
+    const lessons = lessonsResult.rows;
+
+    const currentIndex = lessons.findIndex(lesson => lesson.id === parseInt(currentLessonId));
+    let previous = null;
+    let next = null;
+
+    // Find previous accessible lesson
+    for (let i = currentIndex - 1; i >= 0; i--) {
+      const lessonDeps = await Lesson.checkDependencies(lessons[i].id, userId);
+      if (lessonDeps.all_met || lessons[i].is_completed) {
+        previous = lessons[i];
+        break;
+      }
+    }
+
+    // Find next accessible lesson
+    for (let i = currentIndex + 1; i < lessons.length; i++) {
+      const lessonDeps = await Lesson.checkDependencies(lessons[i].id, userId);
+      if (lessonDeps.all_met || lessons[i].is_completed) {
+        next = lessons[i];
+        break;
+      }
+    }
+
+    return {
+      previous,
+      next,
+      current: lessons[currentIndex],
+      total: lessons.length,
+      completed: lessons.filter(l => l.is_completed).length,
+      currentPosition: currentIndex + 1
+    };
+  }
+
+  static async saveCodeSubmission(userId, lessonId, code) {
+    const query = `
+      INSERT INTO user_progress (user_id, lesson_id, code_submission, completed, score)
+      VALUES ($1, $2, $3, false, 0)
+      ON CONFLICT (user_id, lesson_id) 
+      DO UPDATE SET code_submission = $3, updated_at = CURRENT_TIMESTAMP
+      RETURNING *
+    `;
+    
+    const result = await pool.query(query, [userId, lessonId, code]);
+    return result.rows[0];
+  }
+
+  static async submitLesson(userId, lessonId, code, timeSpent, score, completed) {
+    const query = `
+      INSERT INTO user_progress (user_id, lesson_id, course_id, code_submission, completed, score, time_spent, completed_at)
+      SELECT $1, $2, l.course_id, $3, $4, $5, $6, 
+             CASE WHEN $4 = true THEN CURRENT_TIMESTAMP ELSE NULL END
+      FROM lessons l WHERE l.id = $2
+      ON CONFLICT (user_id, lesson_id) 
+      DO UPDATE SET 
+        code_submission = $3,
+        completed = $4,
+        score = $5,
+        time_spent = user_progress.time_spent + $6,
+        completed_at = CASE WHEN $4 = true THEN CURRENT_TIMESTAMP ELSE user_progress.completed_at END,
+        updated_at = CURRENT_TIMESTAMP
+      RETURNING *
+    `;
+    
+    const result = await pool.query(query, [userId, lessonId, code, completed, score, timeSpent]);
+    return result.rows[0];
+  }
+
+  static async findByIdWithDependencies(lessonId, userId) {
+    const query = `
+      SELECT l.*, 
+             c.title as course_title,
+             c.language_target,
+             c.coding_language,
+             c.id as course_id,
+             EXISTS(
+               SELECT 1 FROM user_progress up 
+               WHERE up.lesson_id = l.id AND up.user_id = $2 AND up.completed = true
+             ) as is_completed,
+             (
+               SELECT JSON_AGG(
+                 JSON_BUILD_OBJECT(
+                   'type', ld.dependency_type,
+                   'required_lesson_id', ld.required_lesson_id,
+                   'required_achievement_type', ld.required_achievement_type,
+                   'min_score', ld.min_score,
+                   'required_lesson_title', rl.title,
+                   'required_achievement_title', at.title
+                 )
+               )
+               FROM lesson_dependencies ld
+               LEFT JOIN lessons rl ON ld.required_lesson_id = rl.id
+               LEFT JOIN achievement_types at ON ld.required_achievement_type = at.type
+               WHERE ld.lesson_id = l.id
+             ) as dependencies,
+             (
+               SELECT up.score
+               FROM user_progress up
+               WHERE up.lesson_id = l.id AND up.user_id = $2
+             ) as user_score,
+             (
+               SELECT up.code_submission
+               FROM user_progress up
+               WHERE up.lesson_id = l.id AND up.user_id = $2
+             ) as user_code
+      FROM lessons l
+      JOIN courses c ON l.course_id = c.id
+      WHERE l.id = $1
+    `;
+    
+    const result = await pool.query(query, [lessonId, userId]);
+    return result.rows[0];
+  }
+
+  static async checkLessonDependencies(lessonId, userId) {
+    const dependenciesQuery = `
+      SELECT ld.*, 
+             rl.title as required_lesson_title,
+             rl.order_index as required_lesson_order,
+             at.title as required_achievement_title,
+             at.description as required_achievement_description
+      FROM lesson_dependencies ld
+      LEFT JOIN lessons rl ON ld.required_lesson_id = rl.id
+      LEFT JOIN achievement_types at ON ld.required_achievement_type = at.type
+      WHERE ld.lesson_id = $1
+    `;
+    
+    const dependenciesResult = await pool.query(dependenciesQuery, [lessonId]);
+    const dependencies = dependenciesResult.rows;
+    
+    const unmetDependencies = [];
+    const metDependencies = [];
+
+    for (const dep of dependencies) {
+      let isMet = false;
+      let userProgress = null;
+      let currentValue = null;
+
+      if (dep.dependency_type === 'lesson' && dep.required_lesson_id) {
+        // Check lesson completion with minimum score
+        const progressQuery = `
+          SELECT up.score, up.completed, up.completed_at
+          FROM user_progress up
+          WHERE up.lesson_id = $1 AND up.user_id = $2
+        `;
+        
+        const progressResult = await pool.query(progressQuery, [dep.required_lesson_id, userId]);
+        userProgress = progressResult.rows[0];
+        
+        if (userProgress && userProgress.completed) {
+          currentValue = userProgress.score || 0;
+          isMet = currentValue >= dep.min_score;
+        } else {
+          currentValue = 0;
+          isMet = false;
+        }
+        
+      } else if (dep.dependency_type === 'achievement' && dep.required_achievement_type) {
+        // Check achievement
+        const achievementQuery = `
+          SELECT 1 FROM user_achievements 
+          WHERE user_id = $1 AND achievement_type = $2
+        `;
+        
+        const achievementResult = await pool.query(achievementQuery, [userId, dep.required_achievement_type]);
+        isMet = achievementResult.rows.length > 0;
+        currentValue = isMet ? 'Earned' : 'Not Earned';
+      }
+
+      const dependencyInfo = {
+        ...dep,
+        is_met: isMet,
+        user_progress: userProgress,
+        current_value: currentValue
+      };
+
+      if (isMet) {
+        metDependencies.push(dependencyInfo);
+      } else {
+        unmetDependencies.push(dependencyInfo);
+      }
+    }
+
+    return {
+      all_met: unmetDependencies.length === 0,
+      met_dependencies: metDependencies,
+      unmet_dependencies: unmetDependencies,
+      total_dependencies: dependencies.length,
+      met_count: metDependencies.length,
+      unmet_count: unmetDependencies.length
+    };
+  }
+
+  static async getCourseLessonsWithDependencies(courseId, userId) {
+    const query = `
+      SELECT l.*,
+             EXISTS(
+               SELECT 1 FROM user_progress up 
+               WHERE up.lesson_id = l.id AND up.user_id = $2 AND up.completed = true
+             ) as is_completed,
+             (
+               SELECT up.score
+               FROM user_progress up
+               WHERE up.lesson_id = l.id AND up.user_id = $2
+             ) as user_score,
+             (
+               SELECT COUNT(*)
+               FROM lesson_dependencies ld
+               WHERE ld.lesson_id = l.id
+             ) as dependency_count
+      FROM lessons l
+      WHERE l.course_id = $1
+      ORDER BY l.order_index ASC
+    `;
+    
+    const result = await pool.query(query, [courseId, userId]);
+    const lessons = result.rows;
+
+    // Enhance each lesson with dependency information
+    const enhancedLessons = await Promise.all(
+      lessons.map(async (lesson) => {
+        const dependencies = await Lesson.checkLessonDependencies(lesson.id, userId);
+        return {
+          ...lesson,
+          dependencies: dependencies,
+          is_locked: !dependencies.all_met && !lesson.is_optional,
+          is_accessible: dependencies.all_met || lesson.is_completed || lesson.is_optional
+        };
+      })
+    );
+
+    return enhancedLessons;
+  }
+
+  static async getNextAccessibleLesson(courseId, userId, currentLessonId = null) {
+    const lessons = await Lesson.getCourseLessonsWithDependencies(courseId, userId);
+    
+    // If current lesson is provided, find the next one
+    if (currentLessonId) {
+      const currentIndex = lessons.findIndex(lesson => lesson.id === parseInt(currentLessonId));
+      if (currentIndex !== -1) {
+        // Find next accessible lesson after current one
+        for (let i = currentIndex + 1; i < lessons.length; i++) {
+          if (lessons[i].is_accessible && !lessons[i].is_completed) {
+            return lessons[i];
+          }
+        }
+      }
+    }
+
+    // Otherwise, find first accessible and incomplete lesson
+    return lessons.find(lesson => lesson.is_accessible && !lesson.is_completed) || null;
+  }
+
+  static async getLessonNavigation(courseId, userId, currentLessonId) {
+    const lessons = await Lesson.getCourseLessonsWithDependencies(courseId, userId);
+    const currentIndex = lessons.findIndex(lesson => lesson.id === parseInt(currentLessonId));
+    
+    if (currentIndex === -1) {
+      return { previous: null, next: null, current: null };
+    }
+
+    const currentLesson = lessons[currentIndex];
+    let previousLesson = null;
+    let nextLesson = null;
+
+    // Find previous accessible lesson
+    for (let i = currentIndex - 1; i >= 0; i--) {
+      if (lessons[i].is_accessible) {
+        previousLesson = lessons[i];
+        break;
+      }
+    }
+
+    // Find next accessible lesson
+    for (let i = currentIndex + 1; i < lessons.length; i++) {
+      if (lessons[i].is_accessible) {
+        nextLesson = lessons[i];
+        break;
+      }
+    }
+
+    return {
+      previous: previousLesson,
+      current: currentLesson,
+      next: nextLesson,
+      total: lessons.length,
+      completed: lessons.filter(l => l.is_completed).length,
+      currentPosition: currentIndex + 1
+    };
+  }
+
+  static async create(lessonData) {
+    const { course_id, title, description, instructions, order_index, coding_challenge, vocabulary, expected_output, is_optional, estimated_duration } = lessonData;
+    const query = `
+      INSERT INTO lessons (course_id, title, description, instructions, order_index, coding_challenge, vocabulary, expected_output, is_optional, estimated_duration)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      RETURNING *
+    `;
+    const values = [course_id, title, description, instructions, order_index, coding_challenge, vocabulary, expected_output, is_optional, estimated_duration];
+    
+    const result = await pool.query(query, values);
+    return result.rows[0];
+  }
+
+  static async addDependency(lessonId, dependencyData) {
+    const { required_lesson_id, required_achievement_type, min_score, dependency_type } = dependencyData;
+    const query = `
+      INSERT INTO lesson_dependencies (lesson_id, required_lesson_id, required_achievement_type, min_score, dependency_type)
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING *
+    `;
+    const values = [lessonId, required_lesson_id, required_achievement_type, min_score, dependency_type];
+    
+    const result = await pool.query(query, values);
+    return result.rows[0];
+  }
+
+  static async getUserLessonProgress(userId, lessonId) {
+    const query = `
+      SELECT up.*, l.title as lesson_title, c.title as course_title
+      FROM user_progress up
+      JOIN lessons l ON up.lesson_id = l.id
+      JOIN courses c ON l.course_id = c.id
+      WHERE up.user_id = $1 AND up.lesson_id = $2
+    `;
+    
+    const result = await pool.query(query, [userId, lessonId]);
+    return result.rows[0];
+  }
+}
+
+export default Lesson;
+
+-- Users table
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    username VARCHAR(50) UNIQUE NOT NULL,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    role VARCHAR(20) DEFAULT 'student',
+    age INTEGER,
+    avatar_url VARCHAR(500),
+    parent_id INTEGER REFERENCES users(id),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    is_active BOOLEAN DEFAULT true
+);
+
+-- Courses table
+CREATE TABLE courses (
+    id SERIAL PRIMARY KEY,
+    title VARCHAR(255) NOT NULL,
+    description TEXT,
+    language_target VARCHAR(50), -- e.g., 'spanish', 'french'
+    coding_language VARCHAR(50), -- e.g., 'blockly', 'python'
+    age_group VARCHAR(20), -- e.g., '4-7', '8-12'
+    difficulty_level INTEGER,
+    thumbnail_url VARCHAR(500),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Lessons table
+CREATE TABLE lessons (
+    id SERIAL PRIMARY KEY,
+    course_id INTEGER REFERENCES courses(id),
+    title VARCHAR(255) NOT NULL,
+    description TEXT,
+    instructions JSONB, -- {en: "instruction", es: "instrucción"}
+    order_index INTEGER,
+    coding_challenge TEXT,
+    vocabulary JSONB, -- {words: [{word: "loop", translation: "bucle", audio_url: ""}]}
+    expected_output TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- User progress table
+CREATE TABLE user_progress (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id),
+    lesson_id INTEGER REFERENCES lessons(id),
+    course_id INTEGER REFERENCES courses(id),
+    code_submission TEXT,
+    completed BOOLEAN DEFAULT false,
+    score INTEGER DEFAULT 0,
+    time_spent INTEGER DEFAULT 0, -- in seconds
+    completed_at TIMESTAMP,
+    UNIQUE(user_id, lesson_id)
+);
+
+-- Achievements table
+CREATE TABLE achievements (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id),
+    type VARCHAR(100), -- e.g., 'first_lesson', 'coding_streak'
+    title VARCHAR(255),
+    description TEXT,
+    icon_url VARCHAR(500),
+    earned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Add these tables to your existing schema
+
+-- Achievement types table
+CREATE TABLE achievement_types (
+    id SERIAL PRIMARY KEY,
+    type VARCHAR(100) UNIQUE NOT NULL,
+    title VARCHAR(255) NOT NULL,
+    description TEXT NOT NULL,
+    icon_url VARCHAR(500),
+    points INTEGER DEFAULT 10,
+    category VARCHAR(50) DEFAULT 'general'
+);
+
+-- User achievements (updated with points)
+CREATE TABLE user_achievements (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id),
+    achievement_type VARCHAR(100) REFERENCES achievement_types(type),
+    title VARCHAR(255),
+    description TEXT,
+    icon_url VARCHAR(500),
+    points_earned INTEGER,
+    earned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, achievement_type)
+);
+
+-- Course dependencies
+CREATE TABLE course_dependencies (
+    id SERIAL PRIMARY KEY,
+    course_id INTEGER REFERENCES courses(id),
+    required_course_id INTEGER REFERENCES courses(id),
+    required_achievement_type VARCHAR(100) REFERENCES achievement_types(type),
+    min_score INTEGER DEFAULT 0,
+    dependency_type VARCHAR(50) NOT NULL -- 'course' or 'achievement'
+);
+
+-- User points and levels
+CREATE TABLE user_points (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) UNIQUE,
+    total_points INTEGER DEFAULT 0,
+    current_level INTEGER DEFAULT 1,
+    level_title VARCHAR(100) DEFAULT 'Beginner Coder',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Lesson dependencies table
+CREATE TABLE lesson_dependencies (
+    id SERIAL PRIMARY KEY,
+    lesson_id INTEGER REFERENCES lessons(id),
+    required_lesson_id INTEGER REFERENCES lessons(id),
+    required_achievement_type VARCHAR(100) REFERENCES achievement_types(type),
+    min_score INTEGER DEFAULT 0,
+    dependency_type VARCHAR(50) NOT NULL, -- 'lesson' or 'achievement'
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Update lessons table with additional fields
+ALTER TABLE lessons ADD COLUMN IF NOT EXISTS order_index INTEGER;
+ALTER TABLE lessons ADD COLUMN IF NOT EXISTS is_optional BOOLEAN DEFAULT false;
+ALTER TABLE lessons ADD COLUMN IF NOT EXISTS estimated_duration INTEGER DEFAULT 900; -- in seconds (15 minutes default)

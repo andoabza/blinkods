@@ -6,17 +6,19 @@ import { Pool } from 'pg';
 import dotenv from 'dotenv';
 import morgan from 'morgan';
 
+import initializeSocket from './socket/lessonHandlers.js';
+
 import Auth from './routes/auth.js';
 import Courses from './routes/courses.js';
 import Progress from './routes/progress.js';
-import AI from './routes/ai.js';
+import Ai from './routes/ai.js';
 import Lesson from './routes/lessons.js';
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: process.env.CLIENT_URL || "http://localhost:3000",
+    origin: process.env.CLIENT_URL || "http://localhost:5173",
     methods: ["GET", "POST"]
   }
 });
@@ -39,33 +41,26 @@ app.use(morgan('dev'));
 app.use('/api/auth', Auth);
 app.use('/api/courses', Courses);
 app.use('/api/progress', Progress);
-app.use('/api/ai', AI);
+app.use('/api/ai', Ai);
 app.use('/api/lessons', Lesson);
 
 // Socket.io for real-time features
-io.on('connection', (socket) => {
-  console.log('User connected:', socket.id);
+io.use((socket, next) => {
+  // You can implement JWT verification here
+  // console.log(socket);
   
-  // Join a lesson room for collaborative coding
-  socket.on('join-lesson', (lessonId) => {
-    socket.join(`lesson-${lessonId}`);
-  });
-  
-  // Real-time code collaboration
-  socket.on('code-change', (data) => {
-    socket.to(`lesson-${data.lessonId}`).emit('code-update', data);
-  });
-  
-  // Live help requests
-  socket.on('request-help', (data) => {
-    // Notify tutors or parents
-    socket.broadcast.emit('help-request', data);
-  });
-  
-  socket.on('disconnect', () => {
-    console.log('User disconnected:', socket.id);
-  });
+  // const token = socket.handshake.auth.token;
+  if (socket) {
+    // Verify token and set user data
+    socket.userId = socket.handshake.auth.userId;
+    socket.username = socket.handshake.auth.username;
+    next();
+  } else {
+    next(new Error('Authentication error'));
+  }
 });
+
+initializeSocket(io);
 
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
